@@ -1,0 +1,330 @@
+#!/usr/bin/env php
+<?php
+declare(ticks = 1);
+//
+// SSBlocker
+//
+// License: MIT
+// Author: Yasuo Ohgaki <yohgaki@ohgaki.net>
+//
+// Super Simple Blocker is fail2ban/denyhost/sshguard like script that scans log file and blocks offending IP.
+// Simple and short script but it supports
+//  - Easy and flexible config file
+//  - Usable with any service logs and firewall commands
+//  - Custom attack count/detection thresholds
+//  - Block time throttling
+//  - Unblocking
+//  - While list
+//  - Rule/Command scripting (CMD_INIT/BLOCK/UNBLOCK can be PHP functions)
+//  - Internal status dump (Statistics)
+//  - Log file rotation (Use HUP signal for precise log scan, but it detects truncation)
+//
+// Requires only 2 files (this script and config)
+// Requires basic PHP command line binary only
+//
+// Usage:
+//   1. Create symlinks to ssblocker for each service
+//       e.g. ln -s ssblocker ssblocker-ipv4-sshd
+//
+//   2. Edit RULES in .cfg. Place it to /etc/ssblocker/, /etc/, /usr/local/etc/ or .
+//       e.g. cp sshblocker-ipv4-sshd /etc/ssblocker-ipv4-sshd.cfg; vi /etc/ssblocker-ipv4-sshd.cfg
+//       See ssblocker-example.cfg and *.cfg dir
+//
+//   3. "ssblocker-log-type /path/to/log" OR "cat /path/to/log | ssblocker-log-type"
+//       e.g. "ssblocker-ipv4-sshd /var/log/sshd.log" OR "journalctl -u sshd -f | ssblocker-ipv4-sshd"
+//
+
+$SCRIPT_NAME = basename($_SERVER['SCRIPT_NAME']);
+ini_set('include_path', '/etc/ssblocker:/etc:/usr/local/etc:.');
+require($SCRIPT_NAME. '.cfg');
+$PID_FILE    = '/var/run/'. $SCRIPT_NAME .'.pid';
+
+// RULE config array index meanings
+const ATTACK_COUNT  = 0;
+const BLOCK_TIME    = 1;
+const DETECT_TIME   = 2;
+const RULE_FUNC     = 3;
+// $ip_managed/unmanaged array index
+const IB_TIME       = 0; // DATE_ATOM
+const IB_ATTACK     = 1; // Attack log
+
+$log_file           = $argv[1] ?? 'php://stdin';
+$log_filesize       = $log_file == 'php://stdin' ? -1 : filesize($log_file);
+$ip_attacked        = []; // [rule => [ip_addr => [ts_attacked1 => msg1, ts_attacked2 => msg2, ... ], ...], ...]
+$attack_cnt         = 0;
+$ts_unblock         = []; // [ts_unblock => ip_addr, ...]
+$ip_blocked         = []; // [ip => blocked_count, ...]
+$ip_managed         = []; // [ip_addr => [IB_TIME, IB_ATTACK], ...]
+$block_cnt          = 0;
+$ip_unmanaged       = []; // [ip_addr => [IB_TIME, IB_ATTACK], ...]
+$unmanaged_cnt = 0;
+$ts_next_unblock    = 0;
+$ts_next_cleanup    = 0;
+$ts_next_bcnt_clear = time() + BLOCK_CNT_DEC;
+$num_lines          = 0; // # of parsed lines
+$WHITE_LIST_IP      = array_flip(WHITE_LIST_IP); // This enables O(1) IP lookup
+
+foreach(RULES as $rule => $cfg) {
+    if (preg_match($rule, 'test string') === false) {
+        echo 'RULES - Broken regex: '. $rule . PHP_EOL;
+        exit(255);
+    }
+    if ($cfg[ATTACK_COUNT] < -1) {
+        echo 'RULES: '. $rule . PHP_EOL;
+        echo 'ATTACK_COUNT must be -1 or more: '. $cfg[ATTACK_COUNT] . PHP_EOL;
+        exit(255);
+    }
+    if ($cfg[BLOCK_TIME] < -1) {
+        echo 'RULES: '. $rule . PHP_EOL;
+        echo 'BLOCK_TIME must be -1 or more: '. $cfg[BLOCK_TIME] . PHP_EOL;
+        exit(255);
+    }
+    if (isset($cfg[DETECT_TIME]) && $cfg[DETECT_TIME] < 0) {
+        echo 'DETECT_TIME must be 0 or more: '. $cfg[DETECT_TIME] . PHP_EOL;
+        exit(255);
+    }
+    if (isset($cfg[RULE_FUNC]) && !is_callable($cfg[RULE_FUNC])) {
+        echo 'RULES: '. $rule . PHP_EOL;
+        echo 'RULE_FUNC must be PHP function'. PHP_EOL;
+        exit(255);
+    }
+}
+
+if (extension_loaded('pcntl')) {
+    if ($log_file == 'php://stdin') {
+        echo 'STDIN Pipe. Signals are not supported.'. PHP_EOL;
+    } else {
+        echo 'PCNTL enabled'. PHP_EOL;
+        echo 'Use USR1 to dump internal status.  i.e. kill -USR1 `cat /var/run/'. $SCRIPT_NAME .'.pid` '. PHP_EOL;
+        echo 'Use HUP to reopen log file.  i.e. kill -HUP `cat /var/run/'. $SCRIPT_NAME .'.pid` '. PHP_EOL;
+    }
+    // Register handler anyway
+    pcntl_async_signals(true);
+    pcntl_signal(SIGUSR1, function($no, $info) {
+        dump_internal_status();
+    });
+    pcntl_signal(SIGHUP, function($no, $info) use (&$fp, $log_file, &$log_filesize) {
+        if ($log_file === 'php://stdin') return;
+        $fp = open_log_file($log_file, $log_filesize);
+        echo date(DATE_ATOM) .' Log file reopened'. PHP_EOL;
+    });
+} else {
+    echo 'No PCNTL. Enable PCNTL to use signals.'. PHP_EOL;
+}
+
+if (!TEST_MODE && CMD_INIT) {
+    echo execute_cmd(CMD_INIT);
+}
+system('echo '. e(getmypid()) .' > '. e($PID_FILE));
+$fp = open_log_file($log_file, $log_filesize);
+
+echo date(DATE_ATOM) .' SSBlocker ('. $SCRIPT_NAME .') start blocking attacker IP'. PHP_EOL;
+if (TEST_MODE) {
+    echo ' TEST_MODE. Init/block/unblock/report commands are ignored. Log file is not seeked to end'. PHP_EOL;
+}
+if (DEBUG_MODE) {
+    echo ' DEBUG_MODE. Debug messages are enabled. '. (is_int(DEBUG_MODE) ? 'Dump internal stat for every '. DEBUG_MODE .'attacks' : 'No internal stat dump') . PHP_EOL;
+}
+
+while(true) { // Simple log line parse and process. Write them all.
+    $line = fgets($fp);
+    if (!$line) {
+        while (!($c = fgetc($fp))) { // Workaround fgets() won't read beyond EOF.
+            sleep(1); // Coreutil tail does this also.
+            if ($log_file != 'php://stdin') {
+                clearstatcache();
+                $tmp = $log_filesize;
+                $log_filesize = filesize($log_file);
+                if ($log_filesize < $tmp) {
+                    echo $log_file .': file truncated'. PHP_EOL;
+                    $fp = open_log_file($log_file, $log_filesize);
+                    $c = '';
+                }
+            }
+        }
+        $line = $c . fgets($fp);
+    }
+    $num_lines++;
+    $t = microtime(true);
+    $T = LOG_TIMESTAMP ? date(DATE_ATOM, $t) : '';
+    // Attack detection and blocking
+    foreach (RULES as $rule => $cfg) {
+        if (!isset($cfg[RULE_FUNC])) {
+            if (!preg_match($rule, $line, $match)) {
+                continue;
+            }
+            $ip = $match[1];
+        } else {
+            $ip = $cfg[RULE_FUNC]($rule, $line);
+            if (!$ip) {
+                continue;
+            }
+        }
+        gc_attack_record($rule, $ip, $t);
+        $th = $cfg[DETECT_TIME] ?? DETECT;
+        $ip_attacked[$rule][$ip][(string)($t + $th)] = $line;
+        echo $T . ' Attacked: ' . $line;
+        $attack_cnt++;
+        if (!TEST_MODE && CMD_REPORT) {
+            echo execute_cmd(CMD_REPORT, $ip, $rule);
+            if ($rule[ATTACK_COUNT] == -1 && $rule[BLOCK_TIME] == -1) {
+                continue; // REPORT only mode
+            }
+        }
+        if (is_int(DEBUG_MODE) && !($attack_cnt % DEBUG_MODE)) {
+            dump_internal_status();
+        }
+        if (isset($WHITE_LIST_IP[$ip])) {
+            break;
+        }
+        if (WHITE_LIST_DOM && !preg_match(WHITE_LIST_DOM, gethostbyaddr($ip))) {
+            break;
+        }
+        if (count($ip_attacked[$rule][$ip]) > $cfg[ATTACK_COUNT]) {
+            if (isset($ip_managed[$ip]) || isset($ip_unmanaged[$ip])) {
+                break; // Prevent multiple blocks for extreme attackers
+            }
+            if ($cfg[BLOCK_TIME]) {
+                $ip_blocked[$ip] = isset($ip_blocked[$ip]) ? ++$ip_blocked[$ip] : 0;
+                $ip_managed[$ip][IB_TIME] = date(DATE_ATOM, $t);
+                $ip_managed[$ip][IB_ATTACK] = $line;
+                $t_unblock = ($cfg[BLOCK_TIME]) * (BLOCK_BASE ** ($ip_blocked[$ip]));
+                $ts_unblock[(string)($t + $t_unblock)] = $ip; // Extremely busy system may lost blocked IP info, but this is good enough for me.
+                $block_msg = ' until ' . date(DATE_ATOM, (int)($t + $t_unblock)) . ' (' . $t_unblock . ' sec) (Blocked: ' . $ip_blocked[$ip] . ' times)';
+            }
+            else {
+                if (TRACK_UNMANAGED) {
+                    // Flushing firewall rule may increment unlimited block count
+                    $ip_blocked[$ip] = isset($ip_blocked[$ip]) ? ++$ip_blocked[$ip] : 0;
+                    $ip_unmanaged[$ip][IB_TIME] = date(DATE_ATOM, $t);
+                    $ip_unmanaged[$ip][IB_ATTACK] = $line;
+                }
+                $unmanaged_cnt++;
+                $block_msg = ' forever (Blocked: ' . $ip_blocked[$ip] . ' times) ';
+            }
+            if (!TEST_MODE) {
+                sleep(CMD_WAIT_SEC);
+            }
+            $block_cnt++;
+            ksort($ts_unblock, SORT_NATURAL); // Due to custom block time and throttling, sort is required. This sort can be removed, but O(n log n) shouldn't be a issue
+            echo $T . ' Blocked: ' . $ip . $block_msg . ' (Managed / Unmanaged Blocks: ' . count($ts_unblock) . ' / ' . $unmanaged_cnt . ')' . PHP_EOL;
+            if (STATUS_DUMP && !($block_cnt % STATUS_DUMP)) {
+                dump_internal_status();
+            }
+            if (DEBUG_MODE) {
+                echo $T . ' Command: ' . CMD_BLOCK . PHP_EOL;
+            }
+            if (!TEST_MODE) {
+                execute_cmd(CMD_BLOCK, $ip, $rule);
+            }
+            break;
+        }
+    }
+
+    // Cleanup old attack records
+    if ($ts_next_cleanup < $t) {
+        foreach ($ip_attacked as $rule => $ips) {
+            foreach($ips as $ip => $tmp) {
+                gc_attack_record($rule, $ip, $t);
+            }
+        }
+        $ts_next_cleanup = $t + 3600;
+    }
+    // Release blocked IPs
+    if ($ts_next_unblock < $t) {
+        foreach ($ts_unblock as $ts => $ip) {
+            if ($ts > $t) {
+                break;
+            }
+            unset($ts_unblock[$ts]);
+            unset($ip_managed[$ip]);
+            echo $T . ' Unblocked: ' . $ip . ' TS: '. $ts . PHP_EOL;
+            if (DEBUG_MODE) {
+                echo $T . ' Command: ' . (is_callable($cmd) ? 'Unblock PHP function' : CMD_UNBLOCK) . PHP_EOL;
+            }
+            if (!TEST_MODE) {
+                echo execute_cmd(CMD_UNBLOCK, $ip);
+            }
+        }
+        $ts_next_unblock = $t + 60;
+    }
+    // Decrement block(attack) counter
+    if ($ts_next_bcnt_clear < $t) {
+        foreach ($ip_blocked as $ip => &$cnt) {
+            if ($cnt > BLOCK_CNT_MIN) {
+                $cnt--;
+            }
+        }
+        $ts_next_bcnt_clear += BLOCK_CNT_DEC;
+    }
+}
+
+function execute_cmd($cmd, $ip = NULL, $rule = NULL) {
+    if (is_callable($cmd)) {
+        return $cmd($ip, $rule);
+    }
+    $cmd = sprintf($cmd, e($ip));
+    return shell_exec($cmd);
+}
+
+function open_log_file($log_file, &$log_filesize) {
+    $fp = fopen($log_file, 'r');
+    if (!$fp) {
+        echo 'Error: cannot open log file - '. $log_file .PHP_EOL;
+        exit(255);
+    }
+    if ($log_file != 'php://stdin') {
+        $log_filesize = filesize($log_file);
+        if (!TEST_MODE) {
+            fseek($fp, 0, SEEK_END);
+        }
+    }
+    return $fp;
+}
+
+function gc_attack_record($rule, $ip, $t) {
+    if (isset($ip_attacked[$rule][$ip])) {
+        foreach ($ip_attacked[$rule][$ip] as $ts => $attack) {
+            if ($ts > $t) {
+                break;
+            }
+            if (DEBUG_MODE) {
+                echo $T . 'Removed attack record: '. $ip .' (' . date(DATE_ATOM, $ts) .') : '. $attack . PHP_EOL;
+            }
+            unset($ip_attacked[$rule][$ip][$ts]);
+        }
+        if (!count($ip_attacked[$rule][$ip])) {
+            unset($ip_attacked[$rule][$ip]);
+        }
+    }
+}
+
+function dump_internal_status() {
+    echo date(DATE_ATOM) .' Rules and internal status: '. $GLOBALS['SCRIPT_NAME'] . PHP_EOL;
+    echo '<?php'. PHP_EOL;
+    echo '$time         = '. time() .';'. PHP_EOL;
+    echo '$script       = \''. $GLOBALS['SCRIPT_NAME'] .'\';'. PHP_EOL;
+    echo '$RULES        = '. var_export(RULES, true) .';'. PHP_EOL;
+    echo '$ip_attacked  = '. var_export($GLOBALS['ip_attacked'], true) .';'. PHP_EOL;
+    echo '$ts_unblock   = '. var_export($GLOBALS['ts_unblock'], true) .';'. PHP_EOL;
+    echo '$ip_blocked   = '. var_export($GLOBALS['ip_blocked'], true) .';'. PHP_EOL;
+    echo '$ip_managed   = '. var_export($GLOBALS['ip_managed'], true) .';'. PHP_EOL;
+    echo '$ip_unmanaged = '. var_export($GLOBALS['ip_unmanaged'], true) .';'. PHP_EOL;
+    echo '$ip_attacked_cnt  = '. count($GLOBALS['ip_attacked'], COUNT_RECURSIVE) .';'. PHP_EOL;
+    echo '$ts_unblock_cnt   = '. count($GLOBALS['ts_unblock'], true) .';'. PHP_EOL;
+    echo '$ip_managed_cnt   = '. count($GLOBALS['ip_managed'], true) .';'. PHP_EOL;
+    echo '$ip_unmanaged_cnt = '. count($GLOBALS['ip_unmanaged'], true) .';'. PHP_EOL;
+    echo '$block_cnt        = '. $GLOBALS['block_cnt'] .';'. PHP_EOL;
+    echo '$unmanaged_cnt    = '. $GLOBALS['unmanaged_cnt'] .';'. PHP_EOL;
+    echo '$attack_cnt       = '. $GLOBALS['attack_cnt'] .';'. PHP_EOL;
+    echo '$num_lines        = '. $GLOBALS['num_lines'] .';'. PHP_EOL;
+    $m = memory_get_usage();$e = (int)(log10($m)/3); // array(1,2,3)[1] selects 2nd array elem. KB/MB/GB. Not KiB/MiB/GiB
+    echo '# Memory usage: '. sprintf('%.2f', $m/1e3**$e) . ['', 'KB', 'MB', 'GB'][$e] . PHP_EOL;
+    echo '$memory           = '. $m .';'. PHP_EOL;
+    $m = memory_get_peak_usage();$e = (int)(log10($m)/3);
+    echo '# Memory peak usage: '. sprintf('%.2f', $m/1e3**$e) . ['', 'KB', 'MB', 'GB'][$e] . PHP_EOL;
+    echo '$memory_peak      = '. $m . ';'. PHP_EOL;
+    echo '?>'. PHP_EOL;
+}
+
+function e($str) { return escapeshellarg($str); }
