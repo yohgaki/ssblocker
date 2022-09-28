@@ -34,7 +34,7 @@ Note: For web application, it is not good idea to block IP forever. You may bloc
 ## Requirement
 
 - Requires basic PHP command line binary only.
-- Requires only 2 files (a script and config)
+- Requires only 2 files (script and config)
 
 ## Installation & Usage (Short Version)
 
