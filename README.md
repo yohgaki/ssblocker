@@ -146,9 +146,9 @@ exec /etc/ssblocker/ssblocker-qmail-smtpd /var/log/qmail/smtpd/current  > /var/l
 #exec /etc/issblocker/ssblocker-sshd /var/log/sshd.log  > /var/log/ssblocker-sshd.log &
 ```
 
-Make sure "ssblocker-*"
+Make sure "ssblocker-*" are symlink to "ssblocker" script.
 
-NOTE: OpenRC can be process supervisor.
+NOTE: OpenRC can be process supervisor. Supervising is bbetter way.
 
 ### Fedora (Systemd)
 
