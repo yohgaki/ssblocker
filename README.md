@@ -50,7 +50,7 @@ SSBlocker is no more than a log scanner that executes commands for matching rule
 
 ## Installation & Usage (Long Version)
 
-SSBlocker scans log files. It does not have command capability. There are only 2 usages:
+SSBlocker scans log files. It does not have command capability. There are only 3 usages:
 
 ```bash
 tail -f /path/to/log | ssblocker
@@ -60,6 +60,13 @@ OR
 
 ```bash
 ssblocker /path/to/log
+```
+
+OR
+
+```bash
+ssblocker "command for getting log"
+e.g. ssblocker "journalctl -f"
 ```
 
 PHP command line is required. Install PHP if it is needed.

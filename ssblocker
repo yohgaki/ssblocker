@@ -34,6 +34,9 @@ declare(ticks = 1);
 //       e.g. "ssblocker-ipv4-sshd /var/log/sshd.log" OR "journalctl -u sshd -f | ssblocker-ipv4-sshd"
 //
 
+// Set your memory limit
+ini_set('memory_limit', '1G');
+
 $SCRIPT_NAME = basename($_SERVER['SCRIPT_NAME']);
 ini_set('include_path', '/etc/ssblocker:/etc:/usr/local/etc:.');
 require($SCRIPT_NAME. '.cfg');
@@ -48,8 +51,18 @@ const RULE_FUNC     = 3;
 const IB_TIME       = 0; // DATE_ATOM
 const IB_ATTACK     = 1; // Attack log
 
-$log_file           = $argv[1] ?? 'php://stdin';
-$log_filesize       = $log_file == 'php://stdin' ? -1 : filesize($log_file);
+// Set log data
+if (empty($argv[1])) {
+    $log_file       = 'php://stdin';
+    $log_file_size  = -1;
+} else if (file_exists($argv[1])) {
+    $log_file       = $argv[1];
+    $log_filesize   = filesize($log_file);
+} else {
+    // Assume command for log data
+    $log_file       = $argv[1];
+    $log_file_size  = -1;
+}
 $ip_attacked        = []; // [rule => [ip_addr => [ts_attacked1 => msg1, ts_attacked2 => msg2, ... ], ...], ...]
 $attack_cnt         = 0;
 $ts_unblock         = []; // [ts_unblock => ip_addr, ...]
@@ -131,7 +144,7 @@ while(true) { // Simple log line parse and process. Write them all.
     if (!$line) {
         while (!($c = fgetc($fp))) { // Workaround fgets() won't read beyond EOF.
             sleep(1); // Coreutil tail does this also.
-            if ($log_file != 'php://stdin') {
+            if (file_exists($log_file)) {
                 clearstatcache();
                 $tmp = $log_filesize;
                 $log_filesize = filesize($log_file);
@@ -268,16 +281,23 @@ function execute_cmd($cmd, $ip = NULL, $rule = NULL) {
 }
 
 function open_log_file($log_file, &$log_filesize) {
-    $fp = fopen($log_file, 'r');
-    if (!$fp) {
-        echo 'Error: cannot open log file - '. $log_file .PHP_EOL;
-        exit(255);
-    }
-    if ($log_file != 'php://stdin') {
+    if (file_exists($log_file)) {
+        $fp = fopen($log_file, 'r');
         $log_filesize = filesize($log_file);
         if (!TEST_MODE) {
             fseek($fp, 0, SEEK_END);
         }
+    } else {
+        if ($log_file == 'php://stdin') {
+            $fp = fopen($log_file, 'r');
+        } else {
+            // Assume command for log data
+            $fp = popen($log_file, 'r');
+	}
+    }
+    if (!$fp) {
+        echo 'Error: cannot open log file - '. $log_file .PHP_EOL;
+        exit(255);
     }
     return $fp;
 }
